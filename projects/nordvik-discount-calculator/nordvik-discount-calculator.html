@@ -173,6 +173,7 @@ details.assump summary::-webkit-details-marker{display:none}
         <div class="eyebrow" style="margin-bottom:6px">역제안 기준 · 전 라인 균일 할인 시 최대치</div>
         <div class="counter" id="counter"></div>
       </div>
+      <div id="approval"></div>
     </aside>
   </div>
 
@@ -195,6 +196,13 @@ details.assump summary::-webkit-details-marker{display:none}
       <span class="tag ex">예시값</span>
     </summary>
     <div class="assbody" id="assbody"></div>
+  </details>
+
+  <details class="assump" id="notifySettings">
+    <summary>
+      <span><h2 style="display:inline">승인 알림 담당자 설정</h2> <span class="small muted">— 메일 수신자와 Slack Webhook을 설정합니다</span></span>
+    </summary>
+    <div class="assbody" id="notifySettingsBody"></div>
   </details>
 
   <p class="note">이 계산기는 내부 검토용입니다. 고객에게 나가는 정식 견적·납기 확약은 해외영업(심수정)·CFO(박민재) 검토를 거칩니다. 원가 항목은 제품 마스터에 없는 값이라 예시로 채워 두었습니다.</p>
@@ -223,6 +231,21 @@ const SCENARIOS = [
 let state = {};  // per-scenario working copy
 SCENARIOS.forEach(s=>state[s.id]={warranty:s.warranty, lines:s.lines.map(l=>({...l}))});
 let current = "s1";
+
+/* ---------- approval workflow ---------- */
+const CONTACTS_KEY = "nordvik-approval-contacts", APPROVALS_KEY = "nordvik-approval-log";
+const DEFAULT_CONTACTS = {cfoName:"박민재", cfoEmail:"mj.park@bluecloud-robotics.example", salesName:"심수정", salesEmail:"sj.shim@bluecloud-robotics.example", slackWebhook:""};
+let CONTACTS = {...DEFAULT_CONTACTS, ...(JSON.parse(localStorage.getItem(CONTACTS_KEY)||"{}"))};
+let APPROVALS = JSON.parse(localStorage.getItem(APPROVALS_KEY)||"{}"); // {scenarioId:[{ts,type,margin,disc,verdict}]}
+const saveContacts = () => localStorage.setItem(CONTACTS_KEY, JSON.stringify(CONTACTS));
+const saveApprovals = () => localStorage.setItem(APPROVALS_KEY, JSON.stringify(APPROVALS));
+function logApproval(scenarioId, type, extra={}){
+  (APPROVALS[scenarioId] ??= []).push({ts:Date.now(), type, ...extra});
+  saveApprovals();
+}
+const latestApproval = id => { const a=APPROVALS[id]; return a && a.length ? a[a.length-1] : null; };
+const APPROVAL_LABEL = {notified_mail:"메일 알림 발송됨", notified_slack:"Slack 알림 발송됨", approved:"승인 완료", rejected:"반려", renegotiate:"재협상 진행 중"};
+const APPROVAL_CLASS = {notified_mail:"warn", notified_slack:"warn", approved:"ok", rejected:"bad", renegotiate:"warn"};
 
 const won = n => "₩" + Math.round(n).toLocaleString("ko-KR");
 const eur = n => "€" + Math.round(n/POLICY.eur).toLocaleString("en-US");
@@ -408,7 +431,87 @@ function renderAssump(){
     renderRequest(); update();
   }));
 }
-function update(){ lineOut(); renderSummary(); renderCompare(); syncMaster(); }
+function mailBody(st, r, sc, s){
+  const lines = st.lines.map(l=>`- ${PRODUCTS[l.p].name} x ${l.q}EA (−${Math.max(l.d,tierOf(l.q)).toFixed(1)}%)`).join("\n");
+  return [
+    `${sc.code} (${sc.title}) 건 할인 승인 검토를 요청드립니다.`, "",
+    `판정: ${s.txt}`,
+    `가중 할인율: −${r.disc.toFixed(1)}%`,
+    `예상 주문 이익률: ${pct(r.margin)}  (목표 ${POLICY.target}% / 최저 허용 ${POLICY.floor}%)`,
+    `예상 주문 이익: ${won(r.profit)}`, "",
+    `견적 라인:`, lines, "",
+    `계산기에서 자세한 시나리오를 확인해 주세요. 검토 부탁드립니다.`
+  ].join("\n");
+}
+function renderApproval(){
+  const st=state[current], r=calc(st.lines,st.warranty), s=status(r.margin), sc=SCENARIOS.find(x=>x.id===current);
+  const needsReview = s.cls==="warn" || s.cls==="bad";
+  const last = latestApproval(current);
+  const pending = last && (last.type==="notified_mail" || last.type==="notified_slack");
+  let html = `<div class="row" style="justify-content:space-between"><h2 style="font-size:13px">승인 워크플로우</h2>${last?`<span class="pill ${APPROVAL_CLASS[last.type]}">${APPROVAL_LABEL[last.type]}</span>`:""}</div>`;
+  if(needsReview){
+    html += `<p class="small muted">판정이 “${s.txt}”입니다. ${CONTACTS.cfoName}(CFO)·${CONTACTS.salesName}(해외영업)에게 알려주세요.</p>
+      <div class="row">
+        <button class="btn primary" id="notifyMail" type="button">📧 메일로 알림</button>
+        <button class="btn" id="notifySlack" type="button" ${CONTACTS.slackWebhook?"":"disabled"}>💬 Slack으로 알림${CONTACTS.slackWebhook?"":" (Webhook 미설정)"}</button>
+      </div>`;
+  } else {
+    html += `<p class="small muted">현재 판정은 영업 재량 승인 범위라 별도 알림이 필요 없습니다.</p>`;
+  }
+  if(pending){
+    html += `<div class="row">
+      <button class="btn" data-decide="approved" type="button">✅ 승인 처리</button>
+      <button class="btn" data-decide="renegotiate" type="button">🔁 재협상 중</button>
+      <button class="btn" data-decide="rejected" type="button">❌ 반려</button>
+    </div>`;
+  }
+  const hist = APPROVALS[current]||[];
+  if(hist.length){
+    html += `<details><summary class="small muted" style="cursor:pointer">승인 이력 (${hist.length}건)</summary>
+      <dl class="kv" style="margin-top:8px">${hist.slice().reverse().map(h=>`<dt>${new Date(h.ts).toLocaleString("ko-KR")}</dt><dd>${APPROVAL_LABEL[h.type]||h.type}${h.margin!=null?` · ${pct(h.margin)}`:""}</dd>`).join("")}</dl>
+    </details>`;
+  }
+  $("approval").innerHTML = html;
+  if(needsReview){
+    $("notifyMail").onclick=()=>{
+      const subject = encodeURIComponent(`[Nordvik 할인 승인 요청] ${sc.code} ${sc.title} — ${s.txt}`);
+      const body = encodeURIComponent(mailBody(st,r,sc,s));
+      window.location.href = `mailto:${CONTACTS.cfoEmail},${CONTACTS.salesEmail}?subject=${subject}&body=${body}`;
+      logApproval(current,"notified_mail",{margin:r.margin, disc:r.disc, verdict:s.txt});
+      renderApproval();
+    };
+    $("notifySlack").onclick=async ()=>{
+      if(!CONTACTS.slackWebhook) return;
+      const text = `*[Nordvik 할인 승인 요청]* ${sc.code} ${sc.title} — *${s.txt}*\n할인율 −${r.disc.toFixed(1)}% · 예상 이익률 ${pct(r.margin)} (목표 ${POLICY.target}% / 하한 ${POLICY.floor}%)\n담당: ${CONTACTS.cfoName}(CFO), ${CONTACTS.salesName}(해외영업)`;
+      try{
+        await fetch(CONTACTS.slackWebhook, {method:"POST", mode:"no-cors", headers:{"Content-Type":"application/json"}, body: JSON.stringify({text})});
+        logApproval(current,"notified_slack",{margin:r.margin, disc:r.disc, verdict:s.txt});
+      }catch(e){
+        alert("Slack 전송 중 오류가 발생했습니다. Webhook 주소를 확인해 주세요.");
+      }
+      renderApproval();
+    };
+  }
+  $("approval").querySelectorAll("[data-decide]").forEach(b=>b.onclick=()=>{
+    logApproval(current, b.dataset.decide, {margin:r.margin, disc:r.disc});
+    renderApproval();
+  });
+}
+function renderNotifySettings(){
+  $("notifySettingsBody").innerHTML = `
+    <div class="agrid">
+      <div><label for="cfoName">CFO 이름</label><input id="cfoName" type="text" value="${CONTACTS.cfoName}"></div>
+      <div><label for="cfoEmail">CFO 이메일</label><input id="cfoEmail" type="email" value="${CONTACTS.cfoEmail}"></div>
+      <div><label for="salesName">해외영업 이름</label><input id="salesName" type="text" value="${CONTACTS.salesName}"></div>
+      <div><label for="salesEmail">해외영업 이메일</label><input id="salesEmail" type="email" value="${CONTACTS.salesEmail}"></div>
+      <div style="grid-column:1/-1"><label for="slackWebhook">Slack Incoming Webhook URL (선택)</label><input id="slackWebhook" type="text" placeholder="https://hooks.slack.com/services/..." value="${CONTACTS.slackWebhook}"></div>
+    </div>
+    <p class="note">이 계산기는 서버가 없는 단일 HTML 파일입니다. "메일로 알림"은 자동 발송 대신 담당자 주소·제목·본문이 채워진 메일 작성 화면을 즉시 띄워 한 번의 클릭으로 보낼 수 있게 해줍니다. Slack은 Webhook 주소를 입력하면 브라우저에서 바로 전송을 시도합니다. 이 값들은 지금 사용 중인 브라우저에만 저장되며 서버로 전송되지 않습니다.</p>`;
+  $("notifySettingsBody").querySelectorAll("input").forEach(el=>el.addEventListener("input",()=>{
+    CONTACTS[el.id]=el.value; saveContacts(); renderApproval();
+  }));
+}
+function update(){ lineOut(); renderSummary(); renderCompare(); syncMaster(); renderApproval(); }
 function syncMaster(){
   const ls=state[current].lines; if(!ls.length){$("masterVal").textContent="—";return;}
   const ds=ls.map(l=>Math.max(l.d,tierOf(l.q))); const same=ds.every(d=>d===ds[0]);
@@ -424,7 +527,7 @@ $("masterRange").addEventListener("input",e=>{
 $("addLine").onclick=()=>{ state[current].lines.push({p:"A100",q:1,d:0}); renderLines(); update(); };
 $("reset").onclick=()=>{ const s=SCENARIOS.find(x=>x.id===current); state[current]={warranty:s.warranty,lines:s.lines.map(l=>({...l}))}; renderAll(); };
 
-renderAssump(); renderAll();
+renderAssump(); renderNotifySettings(); renderAll();
 </script>
 
 </body></html>
